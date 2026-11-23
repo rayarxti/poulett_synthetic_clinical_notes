@@ -1,14 +1,13 @@
 from src.prompts import patient_and_admission_prompts, patient_journey_prompts, clinical_note_prompts
 from src.doc_templates import document_templates, template_sections_to_combine
 from src.dataset_utils import generate_staff_gmc_and_pin, add_sign_off_to_note, prepare_note_data, prepare_patient_data, prepare_admission_data, prepare_encounter_data, prepare_evaluation_data, write_dataset, format_note, get_journey_evaluation_details, generate_staff_gmc_and_pin
-from src.dataset_utils import write_patient_json
+from src.dataset_utils import prepare_patient_record
 from src.processing import call_llm, call_llm_async, read_write_data, clean_outputs, remove_failures, clean_int, combine_patients_and_admissions, clean_patient_details, combine_template_sections, add_abbreviations_to_dict, add_typos_to_dict, normalise_array_struct_column, create_admission_window, random_24_hour_time, build_output_info
 from config.params import PARAMS
 from config.config import CONFIG
 
 import random
 import json
-import re
 import pandas as pd
 import numpy as np
 import string
@@ -19,6 +18,7 @@ import uuid
 from itertools import zip_longest
 import ast
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 DSM5_CRITERION_ORDER = (
     "C1 - Larger amounts or longer than intended",
@@ -1821,7 +1821,7 @@ class add_augmentations():
 
 class save_final_outputs():
     """
-    Saves patient JSON exports and the final CSV datasets.
+    Saves the patient JSONL export and the final CSV datasets.
     """
 
     def __init__(
@@ -1881,13 +1881,14 @@ class save_final_outputs():
         notes_output_data = []
         evaluation_output_data = []
         journey_metrics = []
-        patient_json_paths = []
+        patient_records = []
         if patient_json_dir is None:
             output_root = Path(__file__).resolve().parents[1] / "data" / "patient_json"
             patient_json_dir = (output_root / version_tag).resolve()
             if not patient_json_dir.is_relative_to(output_root):
                 raise ValueError("version_tag must identify a folder inside data/patient_json")
         patient_json_dir = Path(patient_json_dir)
+        patient_jsonl_path = patient_json_dir / "patients.jsonl"
         print("Preparing data...", end = " ")
         input_rows = zip(
             self.patients_and_admissions,
@@ -1895,12 +1896,9 @@ class save_final_outputs():
             self.clinical_notes.itertuples(index=False, name=None),
             strict=True,
         )
-        for patient_number, (patient_admission, journey_row, notes_row) in enumerate(input_rows, start=1):
+        for patient_admission, journey_row, notes_row in input_rows:
             journey = [json.loads(event) for event in journey_row if not pd.isna(event)]
             notes = [None if pd.isna(note) else json.loads(note) for note in notes_row[:len(journey)]]
-            patient_id = patient_admission.get("nsduh_synthetic_id") or patient_admission["patient_id"]
-            filename_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(patient_id))
-            patient_json_path = patient_json_dir / f"patient_{patient_number:02d}_{filename_id}.json"
             exported_journey = journey[:1] if PARAMS["pipeline_config"]["TEST_MODE"] else journey
             target_visit_time = None
             index_date = patient_admission["admission_details"].get("trajectory_index_date")
@@ -1910,10 +1908,9 @@ class save_final_outputs():
                 # History uses months 1 through 12, followed by the target assessment.
                 target_date = add_calendar_months(datetime.fromisoformat(index_date), 13)
                 target_visit_time = target_date.strftime("%Y-%m-%d 00:00:00")
-            write_patient_json(
-                patient_json_path, patient_admission, exported_journey, notes[:len(exported_journey)], target_visit_time
-            )
-            patient_json_paths.append(patient_json_path)
+            patient_records.append(prepare_patient_record(
+                patient_admission, exported_journey, notes[:len(exported_journey)], target_visit_time
+            ))
 
             patient_admission["admission_details"]["admission_id"] = str(uuid.uuid4())
             patient_admission["admission_details"]["encounter_id"] = str(uuid.uuid4())
@@ -1974,5 +1971,13 @@ class save_final_outputs():
         write_dataset(notes_output_data, "clinical_notes", True)
         write_dataset(evaluation_output_df, "journeys", True)
 
+        patient_json_dir.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(dir=patient_json_dir) as staging_dir:
+            staged_path = Path(staging_dir) / patient_jsonl_path.name
+            with staged_path.open("w", encoding="utf-8", newline="\n") as output:
+                for record in patient_records:
+                    output.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+            staged_path.replace(patient_jsonl_path)
+
         print("DONE")
-        return patient_json_paths
+        return patient_jsonl_path

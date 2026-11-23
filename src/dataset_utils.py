@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 from datetime import datetime, timedelta
 import uuid
 import pandas as pd
@@ -12,8 +11,8 @@ from ast import literal_eval
 from src.processing import read_write_data
 
 
-def write_patient_json(path, patient, journey, notes, target_visit_time):
-    """Export one patient as a single-line JSON prediction record."""
+def prepare_patient_record(patient, journey, notes, target_visit_time):
+    """Build the prediction record for one patient."""
     criteria = patient.get("dsm5_criteria") or {}
     severity = None
     if criteria:
@@ -43,7 +42,7 @@ def write_patient_json(path, patient, journey, notes, target_visit_time):
         "sud_substance": patient.get("target_substance") if severity != "none" else None,
         "severity": severity,
     }
-    export = {
+    return {
         "patient_id": patient.get("nsduh_synthetic_id") or patient["patient_id"],
         "success_flag": "FS" if accepted else "PS",
         "history": history,
@@ -52,9 +51,6 @@ def write_patient_json(path, patient, journey, notes, target_visit_time):
         "target_visit_time": target_visit_time,
         "accepted_visit_count": int(accepted),
     }
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(export, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
 
 
 def prepare_note_data(patient_information, event, note):

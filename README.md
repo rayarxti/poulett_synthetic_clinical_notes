@@ -60,9 +60,9 @@ Set `model` in `config/params.py` to `vllm:Qwen/Qwen3.5-27B` before running the 
 
 Set `VLLM_TENSOR_PARALLEL_SIZE` to split the model across multiple GPUs, or `VLLM_MAX_MODEL_LEN` to set a context limit that fits your hardware. For example, set `VLLM_MAX_MODEL_LEN=32768` to cap the context at 32,768 tokens. `VLLM_MAX_TOKENS` caps generated tokens per response and defaults to `8192`.
 
-### Patient JSON output
+### Patient JSONL output
 
-The final notebook step writes one single-line JSON record per patient under `data/patient_json/<version_tag>/`. Its fields are `patient_id`, `success_flag`, `history`, `label`, `target_text`, `target_visit_time`, and `accepted_visit_count`. The `history` string shows admission and discharge times followed by the event notes in journey order. If a discharge timestamp is unavailable, the export uses the final journey event time.
+The final notebook step writes `data/patient_json/<version_tag>/patients.jsonl`, with one JSON record per patient on its own line. Each record contains `patient_id`, `success_flag`, `history`, `label`, `target_text`, `target_visit_time`, and `accepted_visit_count`. The `history` string shows admission and discharge times followed by the event notes in journey order. If a discharge timestamp is unavailable, the export uses the final journey event time.
 
 The current generator samples one admission per patient. If any event note is missing or failed, `history` is empty, `accepted_visit_count` is `0`, and `success_flag` is `PS`. The NSDUH target assessment is scheduled after the 12-month history window, at month 13 from the trajectory index date. Legacy inputs without a trajectory index date or visit months use `null` for `target_visit_time`. The final step also writes the evaluation CSVs.
 
