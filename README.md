@@ -34,25 +34,37 @@ The pipeline is highly configurable using `config/params.py` and `config/config.
 
 Whilst the project was developed on Foundry, it was designed to be easily adaptable to other platforms.
 
-It is currently designed to run locally using the `foundry_sdk` package. However, we hope to keep developing this project to work on more platforms with more LLM providers. 
+The local pipeline reads and writes CSV files and can call OpenAI or run a model locally with vLLM.
 
 The pipeline was tested with Python 3.12.12.
 
 ### Getting Started
 
 1. Read the `docs` to better understand what input data needs to be inputted into the pipeline.
-2. Check the functions `call_llm` and `read_write_data` in `src/processing.py`. These are the only two Foundry-specific functions, so may need to be changed depending on the platform you use.
+2. Configure the model in `config/params.py`. For local inference, follow the vLLM setup below.
 3. Install necessary libraries. These can be found in `requirements.txt` but may need to be installed differently depending on your platform.
 4. Check `config/config.py` and `config/params.py`. For more info see: `docs/adapting_the_pipeline`.
 5. Check `src/dataset_utils.py`, `src/doc_templates.py`, `src/prompts.py` and `src/schemas.py`. For more info see: `docs/adapting_the_pipeline`.
-6. Go to `notebooks/run_pipeline.py` and enjoy!
+6. Run `notebooks/run_pipeline.ipynb`.
 
 ### Dependencies
 
 This project did originally make LLM calls via an API to a deployed version of OpenAI's `gpt-4o` model.
 See [https://openai.com/policies/service-terms](https://openai.com/policies/service-terms) and [https://platform.openai.com/](https://platform.openai.com/) for further details.
 
-You do not have to use this model, and this can be changed with the `call_llm` function.
+### Run a local model with vLLM
+
+Install the `vllm` Python package in the notebook's environment on a supported Linux host with enough memory for the model. Follow the [vLLM installation instructions](https://docs.vllm.ai/en/stable/getting_started/installation/) for your hardware.
+
+Set `model` in `config/params.py` to `vllm:Qwen/Qwen3.5-27B` before running the notebook. The `vllm:` prefix also accepts a local model path. The pipeline loads the model in Python and uses its chat template for each conversation. For Qwen3.5, the pipeline disables thinking mode so the response contains the requested output directly. [vLLM offline chat example](https://docs.vllm.ai/en/stable/examples/basic/offline_inference/)
+
+Set `VLLM_TENSOR_PARALLEL_SIZE` to split the model across multiple GPUs, or `VLLM_MAX_MODEL_LEN` to set a context limit that fits your hardware. For example, set `VLLM_MAX_MODEL_LEN=32768` to cap the context at 32,768 tokens. `VLLM_MAX_TOKENS` caps generated tokens per response and defaults to `8192`.
+
+### Patient JSON output
+
+The final notebook step writes one single-line JSON record per patient under `data/patient_json/<version_tag>/`. Its fields are `patient_id`, `success_flag`, `history`, `label`, `target_text`, `target_visit_time`, and `accepted_visit_count`. The `history` string shows admission and discharge times followed by the event notes in journey order. If a discharge timestamp is unavailable, the export uses the final journey event time.
+
+The current generator samples one admission per patient. If any event note is missing or failed, `history` is empty, `accepted_visit_count` is `0`, and `success_flag` is `PS`. The NSDUH target assessment is scheduled after the 12-month history window, at month 13 from the trajectory index date. Legacy inputs without a trajectory index date or visit months use `null` for `target_visit_time`. The final step also writes the evaluation CSVs.
 
 ### Contributing
 

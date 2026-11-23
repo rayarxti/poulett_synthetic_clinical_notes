@@ -5,7 +5,7 @@
 PARAMS = {
     "pipeline_config": {
         "TEST_MODE": False, # If True, runs pipeline in test mode and generates one clinical note per patient
-        "model" : "gpt-6-luna", # The name of the LLM you would like to use. 
+        "model" : "gpt-6-luna", # Use "vllm:Qwen/Qwen3.5-27B" to run the model locally with vLLM.
         "generate_patient_information": True, # If True, generate patient information
         "generate_admission_information": True, # If True, generate admission details for patients
         "generate_patient_journey": True, # If True, generate patient journey

@@ -1,6 +1,7 @@
 from src.prompts import patient_and_admission_prompts, patient_journey_prompts, clinical_note_prompts
 from src.doc_templates import document_templates, template_sections_to_combine
 from src.dataset_utils import generate_staff_gmc_and_pin, add_sign_off_to_note, prepare_note_data, prepare_patient_data, prepare_admission_data, prepare_encounter_data, prepare_evaluation_data, write_dataset, format_note, get_journey_evaluation_details, generate_staff_gmc_and_pin
+from src.dataset_utils import write_patient_json
 from src.processing import call_llm, call_llm_async, read_write_data, clean_outputs, remove_failures, clean_int, combine_patients_and_admissions, clean_patient_details, combine_template_sections, add_abbreviations_to_dict, add_typos_to_dict, normalise_array_struct_column, create_admission_window, random_24_hour_time, build_output_info
 from config.params import PARAMS
 from config.config import CONFIG
@@ -383,8 +384,9 @@ class generate_admissions():
         self.number_of_generations = number_of_generations if number_of_generations else PARAMS["pipeline_config"]["number_of_generations"]
         self.elective_admission_rate = elective_admission_rate if elective_admission_rate is not None else PARAMS["pipeline_config"]["elective_admission_rate"]
         self.use_rare_admissions = use_rare_admissions if use_rare_admissions is not None else PARAMS["pipeline_config"]["use_rare_admissions"]
-        self.novel_disease_rate = novel_disease_ra
-        te if novel_disease_rate is not None else PARAMS["pipeline_config"]["novel_disease_rate"]
+        self.novel_disease_rate = (
+            novel_disease_rate if novel_disease_rate is not None else PARAMS["pipeline_config"]["novel_disease_rate"]
+        )
         # Model
         self.model = model if model is not None else PARAMS["pipeline_config"]["model"]
         # Initialise data
@@ -763,6 +765,7 @@ class generate_admissions():
                     admission_information["trajectory_index_date"] = visit["index_date"]
                     admission_information["trajectory_visit_month"] = visit["visit_month"]
                     admission_information["trajectory_visit_date"] = visit["visit_date"]
+                    admission_information["date"] = visit["visit_date"]
                     admission_information["trajectory_status"] = visit["status"]
                     admission_information["positive_dsm5_criteria"] = visit[
                         "positive_dsm5_criteria"
@@ -1523,7 +1526,7 @@ class generate_clinical_notes():
         positions = []
         
         for i, (document, journey_event) in enumerate(zip(documents, journey_events)):
-            if journey_event.get("event_type") != "misc":
+            if document is not None and journey_event.get("event_type") != "misc":
                 if self.simple_template_only:
                     template = output_templates.get("simple_note_template", {})
                 else:
@@ -1620,12 +1623,13 @@ class generate_clinical_notes():
                 raw_notes = await self.generate_clinical_notes(self.model, patient_row, journey_row, self.document_templates, list_of_staff_personas)
                 notes = clean_outputs(raw_notes,"dictionary",self.model)
                 for note in notes:
-                    if "Issues" in note:
+                    if isinstance(note, dict) and "Issues" in note:
                         if PARAMS["pipeline_config"]["simple_template_only"]:
                             note["Issues"] = self.remove_structures(note["Issues"])
                         else:
                             note["Issues"] = clean_outputs(note["Issues"], "list", self.model)[0]
                 notes, removed_ids = remove_failures(notes)
+                notes = [note if isinstance(note, dict) else None for note in notes]
                 if removed_ids:
                     print(f"Note {removed_ids} removed due to incorrect json compilation")
     
@@ -1638,9 +1642,23 @@ class generate_clinical_notes():
                     if removed_ids:
                         print(f"Note {removed_ids} could not be validated in validator iteration {i} due to incorrect json compilation")
                         
-                    notes = clean_outputs([val_note.get("content", note) for val_note, note in zip(clean_validated_notes, notes)], "dictionary", self.model) # If note has no content key, replace with orignal note.
-                    all_changes += sum([1 for note in clean_validated_notes if note.get("changes", False) in (True, "True")]) # changes not always a valid key, LLM outputs it incorrectly.
+                    revised_notes = clean_outputs([
+                        validation.get("content", note) if isinstance(validation, dict) else note
+                        for validation, note in zip(clean_validated_notes, notes)
+                    ], "dictionary", self.model)
+                    notes = [
+                        revised if isinstance(revised, dict) and {"note_subject", "note_type"} <= revised.keys() else original
+                        for revised, original in zip(revised_notes, notes)
+                    ]
+                    all_changes += sum(
+                        isinstance(validation, dict) and validation.get("changes") in (True, "True")
+                        for validation in clean_validated_notes
+                    )
                 print(f"Estimated {all_changes} changes...", end = " ")
+                notes = [
+                    note if note and {"note_subject", "note_type"} <= note.keys() else None
+                    for note in notes
+                ]
     
                 if self.combine_sections:
                     combined_notes = []
@@ -1649,11 +1667,12 @@ class generate_clinical_notes():
                     sections_to_combine = [list_of_staff_personas.get(staff_member).get("template_combine_sections").get(j.get("event_type"))
                                           for j, staff_member in zip(journey_row, staff_members)]
                     for note, sections in zip(notes, sections_to_combine):
-                        for section, combine_sections in sections.items():
-                            try:
-                                 note = combine_template_sections(section, combine_sections, note)
-                            except:
-                                print(f"failed to combine note sections: {sections_to_combine}")
+                        if note is not None:
+                            for section, combine_sections in (sections or {}).items():
+                                try:
+                                    note = combine_template_sections(section, combine_sections, note)
+                                except:
+                                    print(f"failed to combine note sections: {sections_to_combine}")
                         combined_notes.append(note)
                     
                     notes = combined_notes
@@ -1739,11 +1758,11 @@ class add_augmentations():
             print(f"Patient {notes_i}")
             augmented_notes = []
 
-            for note_i, note in enumerate([n for n in notes_row if not pd.isna(n)]):
+            for note_i, note in enumerate(notes_row.iloc[:len(journey_row)]):
                 print(f"Note: {note_i}:", end = " ")
-                note = json.loads(note)
+                note = None if pd.isna(note) else json.loads(note)
 
-                if "FAILURE" not in note.keys() and any([self.add_abbreviations_to_content,
+                if note and "FAILURE" not in note and any([self.add_abbreviations_to_content,
                                                     self.add_abbreviations_to_headings,	
                                                     self.add_signature]):
 
@@ -1777,11 +1796,7 @@ class add_augmentations():
                         note = add_sign_off_to_note(note,
                                                     staff_member,
                                                     staff_member_id)
-            
-                    augmented_notes.append(json.dumps(note))
-
-                else:
-                    print("Skipping, note failed to generate")
+                augmented_notes.append(json.dumps(note))
                     
             clean_final_patient_documents.append(augmented_notes)
 
@@ -1806,7 +1821,7 @@ class add_augmentations():
 
 class save_final_outputs():
     """
-    Saves the final clincial notes
+    Saves patient JSON exports and the final CSV datasets.
     """
 
     def __init__(
@@ -1831,7 +1846,7 @@ class save_final_outputs():
         self.add_abbreviations_to_headings = add_abbreviations_to_headings if add_abbreviations_to_headings is not None else PARAMS["pipeline_config"]["add_abbreviations_to_headings"]
         self.add_signature = add_signature if add_signature is not None else PARAMS["pipeline_config"]["add_signature"]
         self.filter_journeys = filter_journey if filter_journey is not None else PARAMS["pipeline_config"]["filter_journey"]
-        self.generate_patient_information = generate_patient_information if generate_patient_information is not None else  PARAMS["pipeline_config"]["generate_patient_information"],
+        self.generate_patient_information = generate_patient_information if generate_patient_information is not None else PARAMS["pipeline_config"]["generate_patient_information"]
         self.site_name = site_name if site_name is not None else PARAMS["pipeline_config"]["site_name"]
         self.site_code = site_code if site_code is not None else PARAMS["pipeline_config"]["site_code"]
         # Data
@@ -1850,7 +1865,6 @@ class save_final_outputs():
         self.patients = patients if patients is not None else read_write_data("intermediate_patients", "read")
         self.admissions = admissions if admissions is not None else read_write_data("intermediate_admissions", "read")
         self.patients_and_admissions = combine_patients_and_admissions(self.patients, self.admissions)
-        #Model
         self.model = model if model is not None else PARAMS["pipeline_config"]["model"]
 
 
@@ -1858,7 +1872,8 @@ class save_final_outputs():
         self,
         run_name,
         current_time,
-        version_tag
+        version_tag,
+        patient_json_dir=None,
     ):
         patients_output_data = []
         admissions_output_data = []
@@ -1866,10 +1881,39 @@ class save_final_outputs():
         notes_output_data = []
         evaluation_output_data = []
         journey_metrics = []
-
+        patient_json_paths = []
+        if patient_json_dir is None:
+            output_root = Path(__file__).resolve().parents[1] / "data" / "patient_json"
+            patient_json_dir = (output_root / version_tag).resolve()
+            if not patient_json_dir.is_relative_to(output_root):
+                raise ValueError("version_tag must identify a folder inside data/patient_json")
+        patient_json_dir = Path(patient_json_dir)
         print("Preparing data...", end = " ")
-        for patient_admission, (journey_i, journey_row), (notes_i, notes_row) in zip(
-            self.patients_and_admissions, self.journeys.iterrows(), self.clinical_notes.iterrows()):
+        input_rows = zip(
+            self.patients_and_admissions,
+            self.journeys.itertuples(index=False, name=None),
+            self.clinical_notes.itertuples(index=False, name=None),
+            strict=True,
+        )
+        for patient_number, (patient_admission, journey_row, notes_row) in enumerate(input_rows, start=1):
+            journey = [json.loads(event) for event in journey_row if not pd.isna(event)]
+            notes = [None if pd.isna(note) else json.loads(note) for note in notes_row[:len(journey)]]
+            patient_id = patient_admission.get("nsduh_synthetic_id") or patient_admission["patient_id"]
+            filename_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(patient_id))
+            patient_json_path = patient_json_dir / f"patient_{patient_number:02d}_{filename_id}.json"
+            exported_journey = journey[:1] if PARAMS["pipeline_config"]["TEST_MODE"] else journey
+            target_visit_time = None
+            index_date = patient_admission["admission_details"].get("trajectory_index_date")
+            if not index_date and patient_admission.get("visit_months"):
+                index_date = PARAMS["pipeline_config"]["nsduh_index_date"]
+            if index_date:
+                # History uses months 1 through 12, followed by the target assessment.
+                target_date = add_calendar_months(datetime.fromisoformat(index_date), 13)
+                target_visit_time = target_date.strftime("%Y-%m-%d 00:00:00")
+            write_patient_json(
+                patient_json_path, patient_admission, exported_journey, notes[:len(exported_journey)], target_visit_time
+            )
+            patient_json_paths.append(patient_json_path)
 
             patient_admission["admission_details"]["admission_id"] = str(uuid.uuid4())
             patient_admission["admission_details"]["encounter_id"] = str(uuid.uuid4())
@@ -1891,18 +1935,17 @@ class save_final_outputs():
             encounters_output_data.append(encounter_data.copy())
             
             # journey metrics
-            journey_row = [json.loads(j) for j in journey_row.to_list() if not pd.isna(j)]
-            journey_eval = get_journey_evaluation_details(patient_admission,
-                                                          journey_row,
-                                                          patient_admission["admission_details"]["expected_length_of_stay"],
-                                                          run_name,
-                                                          current_time)
-            journey_metrics.append(journey_eval)
+            if journey:
+                journey_eval = get_journey_evaluation_details(patient_admission,
+                                                              journey,
+                                                              patient_admission["admission_details"]["expected_length_of_stay"],
+                                                              run_name,
+                                                              current_time)
+                journey_metrics.append(journey_eval)
             
             # clinical notes and journeys
-            for event, note in zip(journey_row, notes_row):
-                if not pd.isna(note):
-                    note = json.loads(note)
+            for event, note in zip(journey, notes):
+                if note:
                     note_with_metadata = prepare_note_data(patient_admission,
                                                        event,
                                                        note)
@@ -1910,7 +1953,7 @@ class save_final_outputs():
                     notes_output_data.append(note_with_metadata.copy())
                 
                     evaluation_data = prepare_evaluation_data(note_with_metadata.copy(),
-                                                   [j for j in journey_row if not pd.isna(j)],
+                                                   journey,
                                                    event,
                                                    patient_data,
                                                    run_name,
@@ -1918,7 +1961,8 @@ class save_final_outputs():
                     evaluation_output_data.append(evaluation_data.copy())
 
         evaluation_output_df = pd.DataFrame(evaluation_output_data)
-        evaluation_output_df = normalise_array_struct_column(evaluation_output_df, "journey") # journey is the only struct where this might occur.
+        if not evaluation_output_df.empty:
+            evaluation_output_df = normalise_array_struct_column(evaluation_output_df, "journey")
         
         # Saving
         print("Saving Data...", end  = " ")
@@ -1931,3 +1975,4 @@ class save_final_outputs():
         write_dataset(evaluation_output_df, "journeys", True)
 
         print("DONE")
+        return patient_json_paths

@@ -12,7 +12,9 @@ from datetime import time as dt_time
 from copy import deepcopy 
 import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
+from functools import cache
 import ast
 
 import os
@@ -25,6 +27,8 @@ load_dotenv()
 
 _loop_semaphore: ContextVar[asyncio.Semaphore] = ContextVar("_loop_semaphore", default=None)
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Keep the synchronous engine on one thread across both LLM entry points.
+_vllm_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vllm")
 
 # FOUNDRY SPECIFIC FUNCTIONS
 
@@ -33,7 +37,43 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 1 - call_llm
 # 2 - read_write_data
 
-def call_llm(prompt: str, model: str = "gpt-6-luna", temp = None, max_attempts: int = 5, chat_history = None) -> str:
+@cache
+def _load_vllm_model(model):
+    try:
+        from vllm import LLM
+    except ModuleNotFoundError as exc:
+        if exc.name != "vllm":
+            raise
+        raise RuntimeError("Install the vllm Python package to use a 'vllm:' model.") from exc
+
+    engine_options = {
+        "tensor_parallel_size": int(os.getenv("VLLM_TENSOR_PARALLEL_SIZE", "1")),
+    }
+    max_model_len = os.getenv("VLLM_MAX_MODEL_LEN")
+    if max_model_len:
+        engine_options["max_model_len"] = int(max_model_len)
+    return LLM(model=model, **engine_options)
+
+
+def _generate_vllm_chat(engine, model, messages, temperature, max_tokens):
+    from vllm import SamplingParams
+
+    if temperature is None:
+        sampling_params = engine.get_default_sampling_params()
+        sampling_params.max_tokens = max_tokens
+    else:
+        sampling_params = SamplingParams(temperature=temperature, max_tokens=max_tokens)
+    template_kwargs = {"enable_thinking": False} if "qwen3.5" in model.lower() else None
+    outputs = engine.chat(
+        messages,
+        sampling_params=sampling_params,
+        chat_template_kwargs=template_kwargs,
+        use_tqdm=False,
+    )
+    return outputs[0].outputs[0].text
+
+
+def call_llm(prompt: str, model: str = "gpt-6-luna", temp = None, max_attempts: int = 5, chat_history = None) -> str | None:
     """
     Send a prompt to a chat-based LLM and return the model's text response.
 
@@ -46,13 +86,13 @@ def call_llm(prompt: str, model: str = "gpt-6-luna", temp = None, max_attempts: 
     prompt : str
         The user prompt appended as the latest message in the conversation.
 
-    model : object
-        Model client implementing `create_chat_completion(request)`.
+    model : str
+        OpenAI model name, or `vllm:<model-id-or-path>` for local vLLM inference.
 
-    temp : float, default=0.7
-        Sampling temperature controlling response randomness.
+    temp : float | None, default=None
+        Sampling temperature for vLLM. Hosted OpenAI uses its model defaults.
 
-    max_attempts : int, default=3
+    max_attempts : int, default=5
         Number of retry attempts if the LLM call fails.
 
     chat_history : list[str] | None, default=None
@@ -62,15 +102,20 @@ def call_llm(prompt: str, model: str = "gpt-6-luna", temp = None, max_attempts: 
 
     Returns
     -------
-    str
+    str | None
         Raw text content from the model response, or None if all attempts fail.
     """
-    # HOSTNAME_VAR.set(os.getenv("FOUNDRY_HOSTNAME"))
-    # TOKEN_VAR.set(os.getenv("TOKEN") or os.getenv("FOUNDRY_TOKEN"))
-    token = os.getenv("OPENAI_API_KEY")
-    client = OpenAI(
-        api_key=token
-    )
+    local_vllm = model.startswith("vllm:")
+    if local_vllm:
+        model = model.removeprefix("vllm:").strip()
+        if not model:
+            raise ValueError("Specify a model ID or path after 'vllm:'.")
+        max_tokens = int(os.getenv("VLLM_MAX_TOKENS", "8192"))
+        if max_tokens < 1:
+            raise ValueError("VLLM_MAX_TOKENS must be positive.")
+        engine = _vllm_worker.submit(_load_vllm_model, model).result()
+    else:
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
     if not chat_history:
         messages = [{"role": "user", "content": prompt}]
@@ -83,15 +128,20 @@ def call_llm(prompt: str, model: str = "gpt-6-luna", temp = None, max_attempts: 
 
     for attempt in range(max_attempts):
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                # temperature=temp,
-            )
-            return str(response.choices[0].message.content)
+            if local_vllm:
+                content = _vllm_worker.submit(
+                    _generate_vllm_chat, engine, model, messages, temp, max_tokens
+                ).result()
+            else:
+                response = client.chat.completions.create(model=model, messages=messages)
+                content = response.choices[0].message.content
+            if not content or not content.strip():
+                raise ValueError("The model returned no response text.")
+            return content
         except Exception as e:
-            print(f"LLM call failed with error: {e} on attempt {attempt + 1}/{max_attempts}. Retrying...")
-            time.sleep( (attempt+1)**2 *10)
+            print(f"LLM call failed with error: {e} on attempt {attempt + 1}/{max_attempts}.")
+            if attempt + 1 < max_attempts:
+                time.sleep((attempt + 1) ** 2 * 10)
 
     print(f"Failed after {max_attempts} attempts.")
     return None

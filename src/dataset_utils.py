@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from datetime import datetime, timedelta
 import uuid
 import pandas as pd
@@ -9,6 +10,52 @@ import string
 import time
 from ast import literal_eval
 from src.processing import read_write_data
+
+
+def write_patient_json(path, patient, journey, notes, target_visit_time):
+    """Export one patient as a single-line JSON prediction record."""
+    criteria = patient.get("dsm5_criteria") or {}
+    severity = None
+    if criteria:
+        positive_count = sum(value is True or value == "Yes" for value in criteria.values())
+        severity = ("none", "mild", "moderate", "severe")[min(positive_count // 2, 3)]
+
+    texts = [format_note(note).strip() for note in notes if note and "FAILURE" not in note]
+    accepted = bool(journey) and len(journey) == len(texts) == len(notes) and all(texts)
+    history = ""
+    if accepted:
+        admission = patient["admission_details"]
+        admission_date = admission.get("date") or admission.get("trajectory_visit_date")
+        timestamp_format = "%Y-%m-%d %H:%M:%S"
+        admission_time = parse_and_normalize_datetime(f"{admission_date} {admission['time']}", timestamp_format)
+        last_event = journey[-1]
+        discharge_datetime = admission.get("discharge_timestamp") or f"{last_event['date']} {last_event['time']}"
+        discharge_time = parse_and_normalize_datetime(discharge_datetime, timestamp_format)
+        history = "\n".join((
+            "Visit 1:",
+            f"Admission time: {admission_time}",
+            f"Discharge time: {discharge_time}",
+            "Discharge note 1:",
+            "\n\n".join(texts),
+        ))
+
+    label = {
+        "sud_substance": patient.get("target_substance") if severity != "none" else None,
+        "severity": severity,
+    }
+    export = {
+        "patient_id": patient.get("nsduh_synthetic_id") or patient["patient_id"],
+        "success_flag": "FS" if accepted else "PS",
+        "history": history,
+        "label": label,
+        "target_text": json.dumps(label, ensure_ascii=False, separators=(",", ":")),
+        "target_visit_time": target_visit_time,
+        "accepted_visit_count": int(accepted),
+    }
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(export, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
+
 
 def prepare_note_data(patient_information, event, note):
     """
@@ -116,7 +163,9 @@ def prepare_admission_data(
         
     patient_information = patient_information.copy()
     
-    admission_datetime = patient_information["admission_details"]["date"] + " " + patient_information["admission_details"]["time"]
+    admission_details = patient_information["admission_details"]
+    admission_date = admission_details.get("date") or admission_details.get("trajectory_visit_date")
+    admission_datetime = f"{admission_date} {admission_details['time']}"
     
     admission_data = {key: None for key in admission_schema.keys()}
     admission_data["rv_group_ids"] = [""]
@@ -201,13 +250,17 @@ def write_dataset(data_dicts, dataset_name, append=False):
     
     if dataset_name in schema_dict.keys():
         schema = schema_dict[dataset_name]
-        df = pd.DataFrame(data_dicts).astype(schema)
+        df = pd.DataFrame(data_dicts, columns=schema).astype(schema)
     else:
         df = pd.DataFrame(data_dicts)
 
     if append:
-        existing_df = read_write_data(dataset_name, "read")
-        df = pd.concat([existing_df, df], ignore_index=True)
+        try:
+            existing_df = read_write_data(dataset_name, "read")
+        except (FileNotFoundError, pd.errors.EmptyDataError):
+            pass
+        else:
+            df = pd.concat([existing_df, df], ignore_index=True)
         
         # Bug fix, may be able to remove later once ran in master
         if "journey" in df.columns:
@@ -350,10 +403,10 @@ def add_sign_off_to_note(note, staff_member, staff_member_id):
     note["Signature"] = f"{staff_member} {id_sign_off}"
     return note
 
-def parse_and_normalize_datetime(value: str) -> str:
+def parse_and_normalize_datetime(value: str, output_format: str = "%Y-%m-%d %H:%M") -> str:
     """
     Parse a datetime string from multiple possible formats
-    and return it as a string in the canonical format: '%Y-%m-%d %H:%M'
+    and return it as a string in the requested format.
     
     Handles:
         - ISO timestamps: '2026-01-05T07:50:00'
@@ -377,13 +430,13 @@ def parse_and_normalize_datetime(value: str) -> str:
     for fmt in formats:
         try:
             dt = datetime.strptime(value, fmt)
-            return dt.strftime("%Y-%m-%d %H:%M")  # canonical output
+            return dt.strftime(output_format)
         except ValueError:
             continue
     # As a last resort, try Python 3.7+ fromisoformat
     try:
         dt = datetime.fromisoformat(value)
-        return dt.strftime("%Y-%m-%d %H:%M")
+        return dt.strftime(output_format)
     except ValueError:
         pass
     raise ValueError(f"Unrecognized datetime format: {value}")
