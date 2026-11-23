@@ -50,6 +50,32 @@ This dataset contains the columns:
 - **CITY**: String of city.
 - **POSTCODE**: String of first half of postcode. e.g. `PL1`.
 
+## NSDUH Synthetic Training Profiles
+
+The patient generator samples records from the NSDUH training split and
+preserves each record's demographics, DSM-5 criteria, and substance-use
+trajectory in the patient intermediates. Configure
+`nsduh_training_profiles_path` in `config/params.py` to point to
+`synthetic_output/train.json`; relative paths resolve from the Poulett project
+root.
+
+Patient records are built directly from the sampled profiles, without an LLM
+patient-generation call. Fields missing from the profiles, including names,
+addresses, contact details, GP, and next of kin, are filled using the existing
+patients input dataset and synthetic values.
+
+Profiles are sampled without replacement within the configured
+`minimum_patient_age` through `maximum_patient_age` range. The default lower
+bound excludes younger profiles because the emergency-admission inputs used by
+this pipeline do not cover patients below 18. Names are sampled from the
+patients input dataset with sex matched to the profile.
+
+For each sampled patient, one visit month is selected and its aligned 11-item
+trajectory status determines the admission context. Visit dates are calculated
+as calendar months after `nsduh_index_date` in `config/params.py`. Any positive
+DSM-5 criteria are appended to the chief complaint and recorded with the
+admission; positive-criteria visits are generated as emergency admissions.
+
 ## Setting Up
 
 This pipeline was tested in Foundry. Therefore, tables were read and written using the `read_write_data` function.

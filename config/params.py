@@ -5,13 +5,13 @@
 PARAMS = {
     "pipeline_config": {
         "TEST_MODE": False, # If True, runs pipeline in test mode and generates one clinical note per patient
-        "model" : "ri.language-model-service..language-model.gpt-5-1", # The name of the LLM you would like to use. 
+        "model" : "gpt-6-luna", # The name of the LLM you would like to use. 
         "generate_patient_information": True, # If True, generate patient information
         "generate_admission_information": True, # If True, generate admission details for patients
         "generate_patient_journey": True, # If True, generate patient journey
         "number_of_generations": 15, # The number of patient journeys to generate
         "admission_start": "2026-01-01", # The start of the range of when admissions can happen.
-        "admission_end": "2026-01-07", # The start of the range of when admissions end. 
+        "admission_end": "2026-12-31", # The start of the range of when admissions end. 
         "elective_start_hour": 7, # The starting hour for elective admissions. (This is 24 hrs)
         "elective_end_hour": 18, # The ending hour for elective admissions. (This is 24 hrs)
         "ae_start_hour": 0, # The starting hour for A&E admissions. (This is 24 hours)
@@ -42,6 +42,8 @@ PARAMS = {
         "elective_admissions_dataset" : "example_elective_admissions_data", # Name of dataset to read elective admissions
         "emergency_admissions_dataset" : "example_emergency_admissions_data", # Name of dataset to read emergency admissions
         "patients_input_dataset" : "example_names_input_data", # Name of dataset containing patients input data, such as names
+        "nsduh_training_profiles_path" : "../sud_dsm5_synthetic_clinical_note/NSDUH-2021_2024-DS0001-bndl-data-tsv_v1/synthetic_output/train.json",
+        "nsduh_index_date" : "2025-12-01", # The index date used to anchor NSDUH visit-month offsets
     },
 }
 

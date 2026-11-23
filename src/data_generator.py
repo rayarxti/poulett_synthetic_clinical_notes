@@ -11,11 +11,36 @@ import re
 import pandas as pd
 import numpy as np
 import string
+import calendar
 from datetime import datetime, timedelta, time
 import asyncio
 import uuid
 from itertools import zip_longest
 import ast
+from pathlib import Path
+
+DSM5_CRITERION_ORDER = (
+    "C1 - Larger amounts or longer than intended",
+    "C2 - Persistent desire or unsuccessful efforts to cut down",
+    "C3 - Great deal of time spent using or obtaining",
+    "C4 - Craving or strong urge to use",
+    "C5 - Recurrent failure to fulfill major role obligations",
+    "C6 - Continued use despite social or interpersonal problems",
+    "C7 - Important activities reduced or given up",
+    "C8 - Recurrent use in hazardous situations or injury risk",
+    "C9 - Continued use despite physical or psychological problems",
+    "C10 - Tolerance",
+    "C11 - Withdrawal",
+)
+
+
+def add_calendar_months(value, months):
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
 
 # Contains functions classes used to generate synthetic journeys and clinical notes
 
@@ -33,11 +58,20 @@ import ast
 def generate_random_person(
         patient_df,
         name_only = False, 
-        last_name_only = False
+        last_name_only = False,
+        gender = None
     ):
     """
     Generates a random person, which can include: name, gender and address.
     """
+    if gender is not None:
+        gender_code = {"male": "M", "female": "F"}.get(str(gender).lower(), str(gender).upper())
+        patient_df = patient_df[
+            patient_df["GENDER"].astype(str).str.strip().str.upper() == gender_code
+        ]
+        if patient_df.empty:
+            raise ValueError(f"No patient names are available for gender {gender!r}")
+
     if last_name_only:
         names = patient_df[["GENDER", "LAST"]].sample(1).values[0]
     else:
@@ -115,6 +149,50 @@ def generate_hospital_staff(
     return staff_names
 
 
+def load_nsduh_training_profiles(path):
+    """Load and validate the NSDUH synthetic training profiles."""
+    profiles_path = Path(path)
+    if not profiles_path.is_absolute():
+        profiles_path = Path(__file__).resolve().parents[1] / profiles_path
+
+    with profiles_path.open(encoding="utf-8") as profiles_file:
+        profiles = json.load(profiles_file)
+
+    if not isinstance(profiles, list):
+        raise ValueError(f"NSDUH training data must be a JSON list: {profiles_path}")
+    for index, profile in enumerate(profiles):
+        if not isinstance(profile, dict):
+            raise ValueError(f"NSDUH training profile {index} must be a JSON object")
+        profile_data = profile.get("profile")
+        if not isinstance(profile_data, dict):
+            raise ValueError(f"NSDUH training profile {index} must include a profile object")
+        demographics = profile_data.get("demographics")
+        criteria = profile_data.get("dsm5_criteria")
+        if not isinstance(demographics, dict) or not isinstance(criteria, dict):
+            raise ValueError(
+                f"NSDUH training profile {index} must include demographics and dsm5_criteria"
+            )
+        required_fields = (
+            "synthetic_id",
+            "target_substance",
+            "other_substances_used",
+            "substance_subclass",
+            "visit_months",
+            "trajectory",
+        )
+        missing_fields = [field for field in required_fields if field not in profile]
+        if missing_fields:
+            raise ValueError(
+                f"NSDUH training profile {index} is missing: {', '.join(missing_fields)}"
+            )
+        if not isinstance(demographics.get("Age"), (int, float)):
+            raise ValueError(f"NSDUH training profile {index} has an invalid Age")
+        if demographics.get("Sex") not in ("Male", "Female"):
+            raise ValueError(f"NSDUH training profile {index} has an invalid Sex")
+
+    return profiles
+
+
 # __________________ GENERATE PATIENTS ___________________
 
 class generate_patients():
@@ -128,10 +206,15 @@ class generate_patients():
         generate_patient_information = None,
         number_of_generations = None,
         bias_tests = None,
-        model = None
+        model = None,
+        profiles = None,
+        profiles_path = None
     ):
         # Data
         self.names_df = names_df if names_df is not None else read_write_data(PARAMS["pipeline_config"]["patients_input_dataset"], "read")
+        self.profiles = profiles
+        self.profiles_path = profiles_path if profiles_path is not None else PARAMS["pipeline_config"]["nsduh_training_profiles_path"]
+        self.selected_profiles = []
         # Params
         self.generate_patient_information = generate_patient_information if generate_patient_information is not None else PARAMS["pipeline_config"]["generate_patient_information"]
         self.number_of_generations = number_of_generations if number_of_generations is not None else PARAMS["pipeline_config"]["number_of_generations"]
@@ -156,53 +239,96 @@ class generate_patients():
     
     async def generate_patients(self, last_name_only = False):
         """
-        Uses an LLM call to generate a list of patients with details.
+        Samples NSDUH profiles and supplies the synthetic fields required downstream.
         """
         N = self.number_of_generations
         last_name_only = True if self.bias_tests is not None and "gender" in self.bias_tests else False
-        
-        patients_info = [generate_random_person(self.names_df, last_name_only = last_name_only) for i in range(N)]
-        gps = [generate_hospital_staff(self.names_df, 1, titles = ["Dr."], doctor_roles = ["GP"]) for i in range(N)]
-        allergies = [self.generate_patient_allergies(self.allergy_prevalence) for i in range(N)]
-        ages = [random.randint(
-            PARAMS["pipeline_config"]["minimum_patient_age"],
-            PARAMS["pipeline_config"]["maximum_patient_age"]
-        ) for i in range(N)]
 
-    
-        prompts = [patient_and_admission_prompts["generate_patient_prompt"].substitute(
-            NAME = patients_info[i]["name"],
-            ADDRESS = patients_info[i]["address"],
-            GP = gps[i][0],
-            ALLERGIES = allergies[i],
-            OUTPUT_FORMAT = json.dumps(document_templates["patient_details"], indent = 2),
-            AGE = ages[i],
-        ) for i in range(N)]
-        
-        tasks = [call_llm_async(prompt, self.model) for prompt in prompts]
-        
-        raw_patient_details = await asyncio.gather(*tasks)
-        
-        return raw_patient_details
+        profiles = self.profiles if self.profiles is not None else load_nsduh_training_profiles(self.profiles_path)
+        minimum_age = PARAMS["pipeline_config"]["minimum_patient_age"]
+        maximum_age = PARAMS["pipeline_config"]["maximum_patient_age"]
+        eligible_profiles = [
+            profile for profile in profiles
+            if minimum_age <= profile["profile"]["demographics"]["Age"] <= maximum_age
+        ]
+        if N > len(eligible_profiles):
+            raise ValueError(
+                f"Requested {N} patients, but only {len(eligible_profiles)} NSDUH profiles "
+                f"are within the configured age range {minimum_age}-{maximum_age}"
+            )
+        self.selected_profiles = random.sample(eligible_profiles, N)
+        patients_information = []
+        admission_start = datetime.strptime(
+            PARAMS["pipeline_config"]["admission_start"], "%Y-%m-%d"
+        )
+
+        for profile in self.selected_profiles:
+            profile_data = profile["profile"]
+            demographics = profile_data["demographics"]
+            age = int(demographics["Age"])
+            identity = generate_random_person(
+                self.names_df,
+                last_name_only=last_name_only,
+                gender=demographics["Sex"],
+            )
+            practice = self.names_df.sample(1).iloc[0]
+            practice_address = " ".join(
+                str(practice[field]) for field in ("ADDRESS", "CITY", "POSTCODE")
+            )
+            birth_year = admission_start.year - age
+            try:
+                date_of_birth = admission_start.replace(year=birth_year).date()
+            except ValueError:
+                date_of_birth = admission_start.replace(year=birth_year, day=28).date()
+
+            patients_information.append({
+                "patient_id": str(uuid.uuid4()),
+                "name": identity["name"],
+                "date_of_birth": date_of_birth.isoformat(),
+                "age": age,
+                "gender": demographics["Sex"],
+                "address": identity["address"],
+                "contact_number": f"07700 900{random.randint(100, 999)}",
+                "allergies": self.generate_patient_allergies(self.allergy_prevalence),
+                "next_of_kin": {
+                    "name": generate_random_person(self.names_df, name_only=True)["name"],
+                    "relationship": random.choice(
+                        ["Partner", "Spouse", "Child", "Parent", "Sibling", "Friend"]
+                    ),
+                    "contact_number": f"07700 900{random.randint(100, 999)}",
+                },
+                "gp_details": {
+                    "name": generate_hospital_staff(
+                        self.names_df, 1, titles=["Dr."], doctor_roles=["GP"]
+                    )[0],
+                    "practice_name": f"{practice['CITY']} Medical Practice",
+                    "address": practice_address,
+                    "contact_number": f"01632 960{random.randint(100, 999)}",
+                },
+                "medical_record_number": str(random.randint(100000000, 999999999)),
+                "nhs_number": str(random.randint(100000000, 999999999)),
+                "nsduh_synthetic_id": profile["synthetic_id"],
+                "demographics": demographics,
+                "dsm5_criteria": profile_data["dsm5_criteria"],
+                "target_substance": profile["target_substance"],
+                "other_substances_used": profile["other_substances_used"],
+                "substance_subclass": profile["substance_subclass"],
+                "visit_months": profile["visit_months"],
+                "trajectory": profile["trajectory"],
+            })
+
+        return patients_information
 
     async def run(self, return_output=False):
         if self.generate_patient_information:
-            print(f'Generating {self.number_of_generations} patients...', end = " ")
+            print(f'Sampling {self.number_of_generations} NSDUH patient profiles...', end = " ")
 
             patients_information = await self.generate_patients()
-            
-            patients_information = clean_outputs(patients_information,"dictionary",self.model)
-            patients_information, removed_ids = remove_failures(patients_information)
-            
-            if removed_ids:
-                print(f"Patients {removed_ids} removed due to incorrect json compilation")
-        
-            for patient_information in patients_information:   
-                patient_information["patient_id"] = str(uuid.uuid4())
-                patient_information["medical_record_number"] = str(random.randint(100000000, 999999999))
-                patient_information["nhs_number"] = str(random.randint(100000000, 999999999))
 
-            list_of_patients = [json.dumps(patient_information) for patient_information in patients_information]
+            list_of_patients = [
+                json.dumps(patient_information)
+                for patient_information in patients_information
+            ]
             list_of_patients_df = pd.DataFrame(list_of_patients)
 
             print("DONE")
@@ -257,7 +383,8 @@ class generate_admissions():
         self.number_of_generations = number_of_generations if number_of_generations else PARAMS["pipeline_config"]["number_of_generations"]
         self.elective_admission_rate = elective_admission_rate if elective_admission_rate is not None else PARAMS["pipeline_config"]["elective_admission_rate"]
         self.use_rare_admissions = use_rare_admissions if use_rare_admissions is not None else PARAMS["pipeline_config"]["use_rare_admissions"]
-        self.novel_disease_rate = novel_disease_rate if novel_disease_rate is not None else PARAMS["pipeline_config"]["novel_disease_rate"]
+        self.novel_disease_rate = novel_disease_ra
+        te if novel_disease_rate is not None else PARAMS["pipeline_config"]["novel_disease_rate"]
         # Model
         self.model = model if model is not None else PARAMS["pipeline_config"]["model"]
         # Initialise data
@@ -277,20 +404,105 @@ class generate_admissions():
     
     async def generate_all_admissions(self, patients_information):
         """
-        Uses an LLM to generate a list of admission reasons.
+        Selects a trajectory visit for each patient, then generates its admission.
         """
-        prompts =  [
-            self.generate_elective_admission_prompt(patient_information)
-            if self.elective_admission_rate > random.random()
-            else self.generate_emergency_admission_prompt(patient_information)
-            for patient_information in patients_information
-        ]
-        
+        prompts = []
+        for patient_information in patients_information:
+            visit = self.select_trajectory_visit(patient_information)
+            if visit is not None:
+                patient_information["admission_trajectory_visit"] = visit
+
+            if visit and visit["positive_dsm5_criteria"]:
+                prompts.append(
+                    self.generate_emergency_admission_prompt(patient_information)
+                )
+            elif self.elective_admission_rate > random.random():
+                prompts.append(
+                    self.generate_elective_admission_prompt(patient_information)
+                )
+            else:
+                prompts.append(
+                    self.generate_emergency_admission_prompt(patient_information)
+                )
+
         tasks = [call_llm_async(prompt, self.model) for prompt in prompts]
         
         all_admissions = await asyncio.gather(*tasks)
         
         return all_admissions
+
+    def select_trajectory_visit(self, patient_details):
+        has_visit_months = "visit_months" in patient_details
+        has_trajectory = "trajectory" in patient_details
+        if not has_visit_months and not has_trajectory:
+            return None
+        if has_visit_months != has_trajectory:
+            raise ValueError(
+                f"Patient {patient_details.get('patient_id')} must include both "
+                "visit_months and trajectory"
+            )
+
+        visit_months = patient_details["visit_months"]
+        trajectory = patient_details["trajectory"]
+        if not visit_months or len(visit_months) != len(trajectory):
+            raise ValueError(
+                f"Patient {patient_details.get('patient_id')} has mismatched "
+                "visit_months and trajectory"
+            )
+        dsm5_criteria = patient_details.get("dsm5_criteria")
+        if not isinstance(dsm5_criteria, dict) or set(dsm5_criteria) != set(DSM5_CRITERION_ORDER):
+            raise ValueError(
+                f"Patient {patient_details.get('patient_id')} must have all 11 "
+                "DSM-5 criterion labels"
+            )
+
+        visit_index = random.randrange(len(visit_months))
+        visit_month = visit_months[visit_index]
+        status = trajectory[visit_index]
+        if not isinstance(visit_month, int) or not 1 <= visit_month <= 12:
+            raise ValueError(f"Invalid trajectory visit month: {visit_month!r}")
+        if not isinstance(status, list) or len(status) != len(DSM5_CRITERION_ORDER):
+            raise ValueError(
+                f"Patient {patient_details.get('patient_id')} has an invalid "
+                "DSM-5 trajectory visit"
+            )
+        if any(value is not None and not isinstance(value, bool) for value in status):
+            raise ValueError(
+                f"Patient {patient_details.get('patient_id')} has a non-Boolean "
+                "DSM-5 trajectory status"
+            )
+
+        positive_criteria = [
+            label
+            for label, is_positive in zip(DSM5_CRITERION_ORDER, status)
+            if is_positive is True
+        ]
+        index_date = datetime.strptime(
+            PARAMS["pipeline_config"]["nsduh_index_date"], "%Y-%m-%d"
+        )
+        visit_date = add_calendar_months(index_date, visit_month)
+        visit_data = visit_date.replace(day=random.randint(1, 28))
+        chief_complaint_addendum = (
+            f"{patient_details.get('target_substance', 'substance')} use with DSM-5 criteria "
+            f"endorsed at month {visit_month}: {', '.join(positive_criteria)}"
+            if positive_criteria
+            else None
+        )
+
+        return {
+            "index_date": index_date.strftime("%Y-%m-%d"),
+            "visit_month": visit_month,
+            "visit_date": visit_date.strftime("%Y-%m-%d"),
+            "status": status,
+            "positive_dsm5_criteria": positive_criteria,
+            "chief_complaint_addendum": chief_complaint_addendum,
+        }
+
+    def get_patient_admission_date(self, patient_details):
+        visit = patient_details.get("admission_trajectory_visit")
+        if visit is not None:
+            return visit["visit_date"]
+        return random.choice(self.admission_window)
 
     def generate_emergency_admission_prompt(self, patient_details):
         """
@@ -300,8 +512,14 @@ class generate_admissions():
         admission_consultant = generate_hospital_staff(self.names_df, 1, titles = ["Dr."], doctor_roles = ["Consultant"])
         
         complaint = self.generate_emergency_admission_complaint(patient_details["gender"][0], int(patient_details["age"]))
+        visit = patient_details.get("admission_trajectory_visit")
+        if visit and visit["chief_complaint_addendum"]:
+            complaint["chief_complaint"] = (
+                f"{complaint['chief_complaint']}; "
+                f"{visit['chief_complaint_addendum']}"
+            )
 
-        admission_date =  random.choice(self.admission_window)
+        admission_date = self.get_patient_admission_date(patient_details)
         admission_time = random_24_hour_time(self.elective_start_hour,
                                      self.elective_end_hour,
                                      self.ae_start_hour,
@@ -347,7 +565,7 @@ class generate_admissions():
         
         procedure = self.generate_elective_procedure(patient_details["gender"][0], int(patient_details["age"]))
 
-        admission_date =  random.choice(self.admission_window)
+        admission_date = self.get_patient_admission_date(patient_details)
         admission_time = random_24_hour_time(self.elective_start_hour,
                                      self.elective_end_hour,
                                      self.ae_start_hour,
@@ -528,6 +746,27 @@ class generate_admissions():
             expected_lengths_of_stay = [clean_int(LoS) for LoS in expected_lengths_of_stay]
             
             for LoS, patient_information, admission_information in zip(expected_lengths_of_stay, patients_information, admissions_information):
+                visit = patient_information.get("admission_trajectory_visit")
+                if visit is not None:
+                    addendum = visit["chief_complaint_addendum"]
+                    if addendum:
+                        chief_complaint = admission_information.get("chief_complaint")
+                        if not isinstance(chief_complaint, str):
+                            raise ValueError(
+                                f"Admission for patient {patient_information['patient_id']} "
+                                "is missing a chief_complaint"
+                            )
+                        if addendum.casefold() not in chief_complaint.casefold():
+                            admission_information["chief_complaint"] = (
+                                f"{chief_complaint.rstrip('; .')}; {addendum}"
+                            )
+                    admission_information["trajectory_index_date"] = visit["index_date"]
+                    admission_information["trajectory_visit_month"] = visit["visit_month"]
+                    admission_information["trajectory_visit_date"] = visit["visit_date"]
+                    admission_information["trajectory_status"] = visit["status"]
+                    admission_information["positive_dsm5_criteria"] = visit[
+                        "positive_dsm5_criteria"
+                    ]
                 admission_information["patient_id"] = patient_information["patient_id"]
                 admission_information["medical_record_number"] = patient_information["medical_record_number"]
                 admission_information["nhs_number"] = patient_information["nhs_number"]

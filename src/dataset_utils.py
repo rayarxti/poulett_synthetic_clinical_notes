@@ -81,6 +81,17 @@ def prepare_patient_data(patient_information):
     patient_data["date_of_birth"] = datetime.strptime(patient_information["date_of_birth"], "%Y-%m-%d").date()
     patient_data["date_of_death"] = datetime(1000, 1, 1).date()
     patient_data["full_name"] = patient_information["name"]
+    for key in (
+        "nsduh_synthetic_id",
+        "demographics",
+        "dsm5_criteria",
+        "target_substance",
+        "other_substances_used",
+        "substance_subclass",
+        "visit_months",
+        "trajectory",
+    ):
+        patient_data[key] = patient_information.get(key)
     patient_data["rv_group_ids"] = [""]
     patient_data["rv_modules"] = [""]
     
@@ -105,7 +116,7 @@ def prepare_admission_data(
         
     patient_information = patient_information.copy()
     
-    admission_datetime = patient_information["admission_details"]["date"] + patient_information["admission_details"]["time"]
+    admission_datetime = patient_information["admission_details"]["date"] + " " + patient_information["admission_details"]["time"]
     
     admission_data = {key: None for key in admission_schema.keys()}
     admission_data["rv_group_ids"] = [""]
@@ -151,6 +162,14 @@ def prepare_admission_data(
     admission_data["site_id"] = site_code
     admission_data["ward"] = patient_information["admission_details"]["ward"]
     admission_data["encounter_id"] = patient_information["admission_details"]["encounter_id"]
+    for key in (
+        "trajectory_index_date",
+        "trajectory_visit_month",
+        "trajectory_visit_date",
+        "trajectory_status",
+        "positive_dsm5_criteria",
+    ):
+        admission_data[key] = patient_information["admission_details"].get(key)
     
     return admission_data
 

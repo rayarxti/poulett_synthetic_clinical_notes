@@ -18,8 +18,8 @@ import ast
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
-from foundry_sdk.v2.language_models.utils import get_openai_base_url, get_http_client
-from foundry_sdk._core.context_and_environment_vars import HOSTNAME_VAR, TOKEN_VAR
+# from foundry_sdk.v2.language_models.utils import get_openai_base_url, get_http_client
+# from foundry_sdk._core.context_and_environment_vars import HOSTNAME_VAR, TOKEN_VAR
 
 load_dotenv()
 
@@ -33,7 +33,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 1 - call_llm
 # 2 - read_write_data
 
-def call_llm(prompt: str, model: str = "ri.language-model-service..language-model.gpt-4-o", temp: float = 0.7, max_attempts: int = 5, chat_history = None) -> str:
+def call_llm(prompt: str, model: str = "gpt-6-luna", temp = None, max_attempts: int = 5, chat_history = None) -> str:
     """
     Send a prompt to a chat-based LLM and return the model's text response.
 
@@ -65,13 +65,11 @@ def call_llm(prompt: str, model: str = "ri.language-model-service..language-mode
     str
         Raw text content from the model response, or None if all attempts fail.
     """
-    HOSTNAME_VAR.set(os.getenv("FOUNDRY_HOSTNAME"))
-    TOKEN_VAR.set(os.getenv("TOKEN") or os.getenv("FOUNDRY_TOKEN"))
-    token = os.getenv("TOKEN")
+    # HOSTNAME_VAR.set(os.getenv("FOUNDRY_HOSTNAME"))
+    # TOKEN_VAR.set(os.getenv("TOKEN") or os.getenv("FOUNDRY_TOKEN"))
+    token = os.getenv("OPENAI_API_KEY")
     client = OpenAI(
-        api_key=token,
-        base_url=get_openai_base_url(preview=True),
-        http_client=get_http_client(preview=True),
+        api_key=token
     )
 
     if not chat_history:
@@ -88,7 +86,7 @@ def call_llm(prompt: str, model: str = "ri.language-model-service..language-mode
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
-                temperature=temp,
+                # temperature=temp,
             )
             return str(response.choices[0].message.content)
         except Exception as e:
